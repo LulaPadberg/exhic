@@ -1,0 +1,153 @@
+console.log("Starting deployment...");
+
+var Web3 = require("web3");
+var Solc = require("solc");
+var Config = require("config");
+var fs = require('fs');
+var Tx = require('ethereumjs-tx');
+var wallet = require('ethereumjs-wallet');
+
+var web3 = new Web3();
+web3.setProvider(new web3.providers.HttpProvider(Config.get('host')));
+
+// Set Gas price
+var maxGas = Config.get('max_gas');
+console.log("Max gas price set to:", maxGas);
+
+// Set address
+var fromAddress = (Config.has('from')) ? Config.get('from') : web3.eth.accounts[0];
+if (fromAddress == null && Config.has())
+    throw new Error("Contract author address not set!");
+
+// Read contracts and create inputs
+var input = {};
+var contracts = Config.get('contracts');
+
+for (var i = 0; i < contracts.length; i++) {
+    // read file
+    console.log("Reading contract:", contracts[i]);
+    var data = fs.readFileSync(contracts[i], 'utf8');
+    input[contracts[i]] = data;
+}
+
+// Compile input
+var output = Solc.compile({ sources: input }, 1);
+
+// Estimate Gas for all contracts
+var gasQuote = {};
+for (var contract in output.contracts) {
+    var code = "0x" + output.contracts[contract].bytecode;
+    var gas = web3.eth.estimateGas({
+        from: fromAddress,
+        data: code
+    });
+    console.log("Contract ", contract, ": estimated gas ", gas);
+    if (gas > maxGas) {
+        throw new Error("Gas price estimate is higher than made maxGas.");
+    }
+    gasQuote[contract] = gas;
+}
+
+// Create contracts.json
+fs.writeFileSync('app/contracts.json', '[]', 'utf8');
+
+// Sign to RPC node
+if (Config.has('private_key')) {
+    pushSignedContract(0);
+}
+else {
+    for (var contract in output.contracts) {
+        var code = "0x" + output.contracts[contract].bytecode;
+        var abi = JSON.parse(output.contracts[contract].interface);
+        var c = web3.eth.contract(abi);
+        pushContract(contract, c);
+    }
+}
+
+function getTransactionReceipt(name, hash, abi, index) {
+    console.log('waiting for contract', name,' to be mined ', hash);
+    const receipt = web3.eth.getTransactionReceipt(hash);
+    if (receipt == null) {
+        setTimeout(() => {
+            getTransactionReceipt(name, hash, abi, index);
+        }, 1000);
+    } else {
+        console.log("Contract (", name, ") mined! Address: ", receipt.contractAddress);
+        writeSolJSON(name, receipt.contractAddress, abi);
+        // Lookup next contract to deploy
+        if (Object.keys(output.contracts).length > ++index)
+            pushSignedContract(index);
+    }
+}
+
+var contractsJSON = [];
+
+function pushSignedContract (index) {
+    console.log("Self signing contract ", Object.keys(output.contracts)[index]);
+    var name = Object.keys(output.contracts)[index];
+    var code = "0x" + output.contracts[name].bytecode;
+    var abi = JSON.parse(output.contracts[name].interface);
+    var c = web3.eth.contract(abi);
+
+    console.log("Preparing ", name);
+    const privateKey = new Buffer(Config.get('private_key'), 'hex');
+    const fromAddress = wallet.fromPrivateKey(privateKey).getAddressString();
+    const contractData = c.new.getData({
+        data: code
+    });
+
+    const nonce = web3.eth.getTransactionCount(fromAddress);
+    const nonceHex = web3.toHex(nonce);
+
+    const rawTx = {
+        nonce: nonceHex,
+        gasPrice: web3.toHex(web3.eth.gasPrice),
+        gasLimit: web3.toHex(gasQuote[name]),
+        data: contractData,
+        from: fromAddress
+    };
+
+    const tx = new Tx(rawTx);
+    tx.sign(privateKey);
+    const serializedTx = tx.serialize();
+    web3.eth.sendRawTransaction('0x' + serializedTx.toString('hex'), (err, hash) => {
+        if (err) { console.log(err); return; }
+        // Log the tx, you can explore status manually with eth.getTransaction()
+        console.log("Contract transaction pushed: TransactionHash (", hash, ") waiting to be mined...");
+        // Wait for the transaction to be mined
+        getTransactionReceipt(name, hash, c.abi, index);
+    });
+
+    return;
+}
+
+function pushContract (name, c) {
+    var x = c.new({
+        from: fromAddress,
+        data: code,
+        gas: gasQuote[contract]
+    }, function (e, contract) {
+        if (!e) {
+            if (!contract.address) {
+                console.log("Contract transaction pushed: TransactionHash (", contract.transactionHash, ") waiting to be mined...");
+            }
+            else {
+                console.log("Contract mined! Address: ", contract.address);
+                writeSolJSON(name, contract.address, contract.abi);
+            }
+        }
+        else {
+            throw new Error(e);
+        }
+    });
+}
+
+function writeSolJSON(name, address, abi) {
+    source = name.split(":")[0];
+    name = name.split(":")[1];
+    var conf = { source: source, name: name, address: address, abi: abi };
+    var contracts = fs.readFileSync('app/contracts.json');
+    contracts = JSON.parse(contracts);
+    contracts.push(conf);
+    fs.writeFileSync('app/contracts.json', JSON.stringify(contracts, null, '\t'));
+}

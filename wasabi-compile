@@ -1,0 +1,38 @@
+console.log("Compile contracts");
+
+var Web3 = require("web3");
+var Solc = require("solc");
+var Config = require("config");
+var fs = require('fs');
+
+var web3 = new Web3();
+
+// Read contracts and create inputs
+var input = {};
+var contracts = Config.get('contracts');
+
+for (var i = 0; i < contracts.length; i++) {
+    // read file
+    console.log("Reading contract:", contracts[i]);
+    var data = fs.readFileSync(contracts[i], 'utf8');
+    input[contracts[i]] = data;
+}
+
+// Compile input
+try {
+    var output = Solc.compile({ sources: input }, 1);
+    console.log("Compile failed! Refer to errors below.");
+    if (output.errors) {
+        output.errors.forEach(function(err) {
+            console.log(err);
+        }, this);
+    }
+    else {
+        for (var contract in output.contracts) {
+            console.log("Successfully compiled: ", contract);
+        }
+    }
+}
+catch (ex) {
+    throw ex;
+}
